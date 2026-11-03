@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.fixed.srt
+*.vtt.orig
+.venv/
+venv/
+.DS_Store

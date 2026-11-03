@@ -1,0 +1,11 @@
+1
+00:00:00,000 --> 00:00:01,000
+This caption is far too fast to read at all.
+
+2
+00:00:05,000 --> 00:00:09,000
+This one is slow and easy to read.
+
+3
+00:00:10,000 --> 00:00:14,000
+Thanks for watching today.
