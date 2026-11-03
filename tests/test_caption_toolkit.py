@@ -207,5 +207,133 @@ class ConvertTests(unittest.TestCase):
             self.assertIn("ERROR", r.stdout)
 
 
+# --- Regression tests for the v0.1.1 bug-free-gate fixes -----------------
+
+# Two healthy captions plus one zero-duration caption full of text.
+# The old parser silently dropped the broken cue and reported PASS.
+ZERO_DURATION_SRT = """1
+00:00:00,000 --> 00:00:04,000
+Hello and welcome back.
+
+2
+00:00:05,000 --> 00:00:05,000
+This caption has zero duration but plenty of text to read.
+
+3
+00:00:10,000 --> 00:00:14,000
+Thanks for watching today.
+"""
+
+INVERTED_SRT = """1
+00:00:00,000 --> 00:00:04,000
+Hello and welcome back.
+
+2
+00:00:09,000 --> 00:00:05,000
+This caption ends before it even starts at all.
+"""
+
+ALL_INVALID_SRT = """1
+00:00:05,000 --> 00:00:05,000
+The only caption in this file is broken.
+"""
+
+
+class InvalidCaptionTests(unittest.TestCase):
+    """C1: captions with end <= start must never be silently dropped."""
+
+    def test_zero_duration_caption_is_hold_not_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "zero.srt", ZERO_DURATION_SRT)
+            r = run_cli("check", str(f))
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("Verdict: HOLD", r.stdout)
+            self.assertIn("Invalid captions: 1", r.stdout)
+            self.assertNotIn("Verdict: PASS", r.stdout)
+
+    def test_inverted_caption_is_hold_not_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "inverted.srt", INVERTED_SRT)
+            r = run_cli("check", str(f))
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("Verdict: HOLD", r.stdout)
+            self.assertIn("Invalid captions: 1", r.stdout)
+
+    def test_all_invalid_reports_invalid_not_no_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "allbad.srt", ALL_INVALID_SRT)
+            r = run_cli("check", str(f))
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("Invalid captions: 1", r.stdout)
+            self.assertIn("Verdict: HOLD", r.stdout)
+            self.assertNotIn("no caption events parsed", r.stdout)
+
+    def test_parser_collects_invalid_separately(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "zero.srt", ZERO_DURATION_SRT)
+            valid, invalid = ct.parse_captions_detailed(f)
+            self.assertEqual(len(valid), 2)
+            self.assertEqual(len(invalid), 1)
+            self.assertLessEqual(invalid[0].end, invalid[0].start)
+            self.assertIn("zero duration", invalid[0].text)
+
+    def test_fix_refuses_invalid_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "zero.srt", ZERO_DURATION_SRT)
+            r = run_cli("fix", str(f))
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("ERROR", r.stdout)
+            self.assertIn("Invalid captions: 1", r.stdout)
+            self.assertFalse((Path(tmp) / "zero.fixed.srt").exists())
+
+
+class FixTargetValidationTests(unittest.TestCase):
+    """C2: --target must be a positive finite number, validated up front."""
+
+    def _assert_clean_rejection(self, target):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "fixable.srt", FIXABLE_SRT)
+            r = run_cli("fix", str(f), "--target", target)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("ERROR", r.stdout)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertFalse((Path(tmp) / "fixable.fixed.srt").exists())
+
+    def test_target_zero_rejected(self):
+        self._assert_clean_rejection("0")
+
+    def test_target_nan_rejected(self):
+        self._assert_clean_rejection("nan")
+
+    def test_target_inf_rejected(self):
+        self._assert_clean_rejection("inf")
+
+    def test_target_negative_rejected_no_corrupt_file(self):
+        self._assert_clean_rejection("-5")
+
+    def test_fix_captions_rejects_bad_targets_directly(self):
+        caps = [ct.Caption(start=0.0, end=1.0, lines=["Some text here."])]
+        for bad in (0, -5, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                ct.fix_captions(caps, target_cps=bad)
+
+    def test_fix_never_moves_end_earlier_when_overlapped(self):
+        # The next caption starts BEFORE the fast caption's original end
+        # (overlap). The old min(desired, limit) logic moved the end
+        # earlier — corrupting the caption. It must stay put instead.
+        caps = [
+            ct.Caption(start=0.0, end=2.0,
+                       lines=["This caption is far too fast to read at all."]),
+            ct.Caption(start=1.0, end=5.0,
+                       lines=["A slow one that overlaps the first."]),
+        ]
+        fixed, changes = ct.fix_captions(caps, target_cps=17.0)
+        for orig, new in zip(caps, fixed):
+            self.assertGreaterEqual(new.end, orig.end)
+            self.assertGreater(new.end, new.start)
+        self.assertEqual(fixed[0].end, 2.0)  # blocked, unchanged
+        self.assertTrue(changes[0].get("blocked"))
+
+
 if __name__ == "__main__":
     unittest.main()

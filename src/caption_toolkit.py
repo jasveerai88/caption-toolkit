@@ -15,6 +15,11 @@ Thresholds (same gates as Faceless QC Lite's caption check):
 Exit codes for `check`: 0 = PASS, 1 = WARN, 2 = HOLD.
 File / parse errors print ``ERROR: ...`` and return 2 (never a pass).
 
+Captions whose end time is <= their start time are INVALID: they are
+never silently dropped. `check` lists them and returns HOLD (exit 2);
+`fix` and `convert` refuse (exit 2, nothing written) until they are
+corrected by hand.
+
 Commands:
   check FILE.srt|FILE.vtt
   fix FILE.srt|FILE.vtt [--target CPS]   (writes FILE.fixed.srt)
@@ -28,6 +33,8 @@ import statistics
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+__version__ = "0.1.1"
 
 WARN_CPS = 17.0
 HOLD_MEDIAN_CPS = 20.0
@@ -91,10 +98,16 @@ class Caption:
         return self.char_count / self.duration
 
 
-def parse_captions(path):
-    """Parse an .srt or .vtt file into a list of Caption objects."""
+def parse_captions_detailed(path):
+    """Parse an .srt or .vtt file into (valid, invalid) Caption lists.
+
+    A cue with text whose end time is <= its start time is INVALID: it is
+    collected in the second list, never silently dropped, so callers can
+    report it instead of certifying a broken file.
+    """
     text = Path(path).read_text(encoding="utf-8-sig", errors="ignore")
-    captions = []
+    valid = []
+    invalid = []
     # Split into blocks on blank lines; works for both SRT and VTT.
     blocks = re.split(r"\n\s*\n", text.replace("\r\n", "\n").strip())
     for block in blocks:
@@ -119,10 +132,36 @@ def parse_captions(path):
             if not before.isdigit():
                 identifier = before
         body = lines[ts_idx + 1:]
-        if body and end > start:
-            captions.append(Caption(start=start, end=end, lines=body,
-                                    identifier=identifier))
-    return captions
+        if body:
+            cap = Caption(start=start, end=end, lines=body,
+                          identifier=identifier)
+            if end > start:
+                valid.append(cap)
+            else:
+                invalid.append(cap)
+    return valid, invalid
+
+
+def parse_captions(path):
+    """Parse an .srt or .vtt file into a list of valid Caption objects.
+
+    Invalid cues (end <= start) are excluded here; use
+    parse_captions_detailed() when they must be reported (the CLI does).
+    """
+    valid, _invalid = parse_captions_detailed(path)
+    return valid
+
+
+def print_invalid(invalid):
+    """List invalid captions (end <= start) for a report."""
+    print(f"Invalid captions: {len(invalid)} "
+          f"(end time <= start time — cannot be measured):")
+    for cap in invalid:
+        first = cap.lines[0] if cap.lines else ""
+        if len(first) > 60:
+            first = first[:57] + "..."
+        print(f"  ! {sec_to_ts(cap.start, '.')} --> {sec_to_ts(cap.end, '.')} "
+              f"| {cap.char_count} chars | {first}")
 
 
 def detect_format(path):
@@ -177,22 +216,29 @@ def cmd_check(args):
     if detect_format(path) is None:
         print(f"ERROR: unsupported file type (expected .srt or .vtt): {path}")
         return 2
-    captions = parse_captions(path)
-    if not captions:
+    captions, invalid = parse_captions_detailed(path)
+    if not captions and not invalid:
         print(f"ERROR: no caption events parsed from {path.name}")
         return 2
-    cps_values = [c.cps for c in captions]
-    verdict, med, mx = verdict_for(cps_values)
     print(f"caption-toolkit check — {path.name}")
-    for i, cap in enumerate(captions, 1):
-        flag = ""
-        if cap.cps > HOLD_MAX_CPS:
-            flag = "  <-- HOLD (>30 CPS)"
-        elif cap.cps > WARN_CPS:
-            flag = "  <-- fast (>17 CPS)"
-        print(f"  #{i} {sec_to_ts(cap.start, '.')} --> {sec_to_ts(cap.end, '.')} "
-              f"| {cap.char_count} chars / {cap.duration:.2f}s = {cap.cps:.1f} CPS{flag}")
-    print(f"Captions: {len(captions)} | median {med:.1f} CPS | max {mx:.1f} CPS")
+    verdict = med = mx = None
+    if captions:
+        cps_values = [c.cps for c in captions]
+        verdict, med, mx = verdict_for(cps_values)
+        for i, cap in enumerate(captions, 1):
+            flag = ""
+            if cap.cps > HOLD_MAX_CPS:
+                flag = "  <-- HOLD (>30 CPS)"
+            elif cap.cps > WARN_CPS:
+                flag = "  <-- fast (>17 CPS)"
+            print(f"  #{i} {sec_to_ts(cap.start, '.')} --> {sec_to_ts(cap.end, '.')} "
+                  f"| {cap.char_count} chars / {cap.duration:.2f}s = {cap.cps:.1f} CPS{flag}")
+        print(f"Captions: {len(captions)} | median {med:.1f} CPS | max {mx:.1f} CPS")
+    if invalid:
+        # A broken caption can never be certified: report it and HOLD.
+        print_invalid(invalid)
+        print("Verdict: HOLD (invalid captions present: end <= start)")
+        return 2
     print(f"Verdict: {verdict} (PASS median <=17, WARN median >17, "
           f"HOLD median >20 or any >30)")
     return EXIT_FOR_VERDICT[verdict]
@@ -206,6 +252,9 @@ def fix_captions(captions, target_cps=DEFAULT_FIX_TARGET_CPS):
     past the next caption's start (the last caption may extend freely).
     Text is never changed.
     """
+    if not math.isfinite(target_cps) or target_cps <= 0:
+        raise ValueError(
+            f"target_cps must be a positive finite number, got {target_cps!r}")
     new = [Caption(start=c.start, end=c.end, lines=list(c.lines),
                    identifier=c.identifier) for c in captions]
     changes = []
@@ -218,7 +267,15 @@ def fix_captions(captions, target_cps=DEFAULT_FIX_TARGET_CPS):
         desired_ms = math.ceil(cap.char_count / target_cps * 1000)
         desired_end = cap.start + desired_ms / 1000
         limit = new[i + 1].start if i + 1 < len(new) else desired_end
-        cap.end = min(desired_end, limit)
+        new_end = min(desired_end, limit)
+        # Mechanical guarantee: an end may only ever move LATER — never
+        # earlier than the caption's original end, and never to <= start
+        # (an overlapping next caption must not corrupt this one).
+        if new_end < old_end:
+            new_end = old_end
+        cap.end = new_end
+        assert cap.end >= old_end, "fix moved a caption end earlier"
+        assert cap.end > cap.start, "fix made a caption end <= its start"
         fully = cap.end >= desired_end - 1e-9
         if cap.end > old_end:
             changes.append({
@@ -235,6 +292,12 @@ def fix_captions(captions, target_cps=DEFAULT_FIX_TARGET_CPS):
 
 
 def cmd_fix(args):
+    # Validate the target BEFORE touching any file: a zero, negative,
+    # NaN or infinite target must never crash or corrupt the output.
+    if not math.isfinite(args.target) or args.target <= 0:
+        print(f"ERROR: --target must be a positive finite number "
+              f"(got {args.target})")
+        return 2
     path = Path(args.file)
     if not path.is_file():
         print(f"ERROR: file not found: {path}")
@@ -242,7 +305,12 @@ def cmd_fix(args):
     if detect_format(path) is None:
         print(f"ERROR: unsupported file type (expected .srt or .vtt): {path}")
         return 2
-    captions = parse_captions(path)
+    captions, invalid = parse_captions_detailed(path)
+    if invalid:
+        print(f"ERROR: {path.name} contains invalid captions "
+              f"(end <= start) — fix them by hand first; nothing written:")
+        print_invalid(invalid)
+        return 2
     if not captions:
         print(f"ERROR: no caption events parsed from {path.name}")
         return 2
@@ -284,7 +352,12 @@ def cmd_convert(args):
         print(f"ERROR: file is already {src_fmt}: {path.name} (use --to "
               f"{'vtt' if src_fmt == 'srt' else 'srt'})")
         return 2
-    captions = parse_captions(path)
+    captions, invalid = parse_captions_detailed(path)
+    if invalid:
+        print(f"ERROR: {path.name} contains invalid captions "
+              f"(end <= start) — fix them by hand first; nothing written:")
+        print_invalid(invalid)
+        return 2
     if not captions:
         print(f"ERROR: no caption events parsed from {path.name}")
         return 2

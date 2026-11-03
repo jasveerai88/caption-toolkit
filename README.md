@@ -17,8 +17,10 @@ captions by extending them into the silence that already follows them.
 | Verdict | Rule |
 |---|---|
 | PASS | median CPS ≤ 17 and max CPS ≤ 30 |
-| WARN | median CPS > 17 |
-| HOLD | median CPS > 20 **or** any single caption > 30 CPS |
+| WARN | median CPS > 17 (and no HOLD rule triggered) |
+| HOLD | median CPS > 20 |
+| HOLD | **any single caption > 30 CPS** — even when the median is fine |
+| HOLD | any caption with end ≤ start (invalid timing, cannot be measured) |
 
 These are the same caption-speed gates used by
 [Faceless QC Lite](https://github.com/jasveerai88/faceless-qc-lite),
@@ -42,15 +44,22 @@ python3 src/caption_toolkit.py convert examples/sample.vtt --to srt
 into the gap before the next caption (target: 17 CPS), never moves a caption
 earlier, never shortens one, never overlaps the next caption, and never
 touches the text. If there is no gap, it says so and leaves that caption
-unchanged. The last caption may extend freely.
+unchanged. The last caption may extend freely. `--target` must be a positive
+finite number — anything else (0, negative, `nan`, `inf`) is rejected with
+an error before any file is touched.
 
-## Real run (verbatim, v0.1.0)
+Captions whose end time is at or before their start time are **invalid**:
+they are never silently ignored. `check` lists them and returns HOLD;
+`fix` and `convert` refuse with an error and write nothing until the
+timings are corrected by hand.
+
+## Real run (verbatim, v0.1.1)
 
 Input — `examples/sample.srt`, whose first caption crams 44 characters into
 1 second:
 
 ```text
-$ python3 src/caption_toolkit.py check sample.srt
+$ python3 src/caption_toolkit.py check examples/sample.srt
 caption-toolkit check — sample.srt
   #1 00:00:00.000 --> 00:00:01.000 | 44 chars / 1.00s = 44.0 CPS  <-- HOLD (>30 CPS)
   #2 00:00:05.000 --> 00:00:09.000 | 34 chars / 4.00s = 8.5 CPS
@@ -61,7 +70,7 @@ Verdict: HOLD (PASS median <=17, WARN median >17, HOLD median >20 or any >30)
 ```
 
 ```text
-$ python3 src/caption_toolkit.py fix sample.srt
+$ python3 src/caption_toolkit.py fix examples/sample.srt
 caption-toolkit fix — sample.srt -> sample.fixed.srt
   #1: end 00:00:01.000 -> 00:00:02.589 | 44.0 -> 17.0 CPS
 Verdict before: HOLD | after: PASS (median 8.5 CPS, max 17.0 CPS)
@@ -70,7 +79,7 @@ Note: timing only — no caption text was changed, and no caption was moved earl
 ```
 
 ```text
-$ python3 src/caption_toolkit.py check sample.fixed.srt
+$ python3 src/caption_toolkit.py check examples/sample.fixed.srt
 caption-toolkit check — sample.fixed.srt
   #1 00:00:00.000 --> 00:00:02.589 | 44 chars / 2.59s = 17.0 CPS
   #2 00:00:05.000 --> 00:00:09.000 | 34 chars / 4.00s = 8.5 CPS
@@ -81,7 +90,7 @@ Verdict: PASS (PASS median <=17, WARN median >17, HOLD median >20 or any >30)
 ```
 
 ```text
-$ python3 src/caption_toolkit.py convert sample.srt --to vtt
+$ python3 src/caption_toolkit.py convert examples/sample.srt --to vtt
 caption-toolkit convert — sample.srt (srt) -> sample.vtt (vtt) | 3 captions
 (exit code: 0)
 ```
@@ -90,13 +99,18 @@ caption-toolkit convert — sample.srt (srt) -> sample.vtt (vtt) | 3 captions
 
 ```bash
 python3 -m unittest discover -s tests -v
-# Ran 10 tests — OK
+# Ran 21 tests — OK
 ```
 
 The suite covers both directions: slow captions PASS (exit 0), a WARN-band
 file exits 1, fast captions HOLD (exit 2), `fix` measurably improves CPS and
 its output passes `check`, a no-gap caption is honestly reported as
-unfixable, and SRT→VTT→SRT conversion round-trips timing and text.
+unfixable, and SRT→VTT→SRT conversion round-trips timing and text. The
+v0.1.1 regression tests add: zero-duration and inverted captions HOLD
+instead of passing, an all-invalid file reports its invalid captions,
+`fix` refuses invalid files and writes nothing, bad `--target` values
+(0, negative, `nan`, `inf`) are rejected cleanly, and `fix` can never move
+a caption's end earlier — even when captions overlap.
 
 ## Internal use
 
