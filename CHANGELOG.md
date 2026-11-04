@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.3.0 — 2026-11-04
+
+Post-Whisper structural QA: two new commands, `lint` and `repair`.
+
+- **`lint FILE` (report-only)** — per-cue structural findings with
+  severities, under the same PASS / WARN / HOLD verdict scale and exit
+  codes as `check`: `overlap` (HOLD), `empty-text` (HOLD),
+  `invalid-timing` (HOLD), `cps-hold` (a cue over 30 CPS, HOLD),
+  `too-short` (< 0.8s), `too-long` (> 7s), `line-too-long` (> 42 visible
+  chars), `too-many-lines` (> 2 lines), `flicker-gap` (< 80ms to the
+  next cue), `cps-fast` (> 17 CPS). Lint numbers cues in file order and
+  counts **every** cue — including empty-text cues, which the `check`
+  parser skips entirely (that blind spot is why lint exists).
+- **`repair FILE [-o OUT]`** — conservative, text-preserving repairs
+  only: drop empty cues; trim ends so every gap to the next cue is at
+  least 80ms (also fixing overlaps), never below start + 0.4s — an
+  impossible trim is reported `NOT fixed` and the cue left untouched;
+  split a cue over 7s or over 2 lines at a word boundary, dividing its
+  span proportionally to character counts with 80ms between parts.
+  Caption text is never added, removed or reworded (a split keeps every
+  word in order; only its line breaks may move). Repair never
+  overwrites its input, refuses invalid-caption files like
+  `fix`/`convert` (nothing written), prints a per-cue change log, and
+  exits with the lint verdict of the repaired file. **Idempotent:**
+  repairing its own output reports no changes and writes a
+  byte-identical file — pinned by a test.
+- Both commands support `--json` with the v0.2.0 conventions (one
+  object, findings/changes as arrays, `{"error": ...}` objects, same
+  exit codes).
+- New example `examples/messy-whisper.srt` — a deliberately broken
+  transcription (overlap, 50ms flicker gap, empty cue, 9-second cue)
+  used for the README's verbatim lint + repair runs.
+- One design fix during development: the greedy split plan could leave
+  a sub-0.4s tail part on line-driven splits; a character-balanced plan
+  is now tried before a cue is reported unsplittable.
+- Tests: 50 total (was 28) — every lint rule both directions, JSON/text
+  agreement, word-preservation and span-tiling of splits, the
+  idempotence test, unfixable-overlap, refusal and `-o` validation
+  tests, and VTT lint/repair coverage.
+
 ## v0.2.0 — 2026-11-03
 
 Agent-ready release (no behaviour change to the text reports):

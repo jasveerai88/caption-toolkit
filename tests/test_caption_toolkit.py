@@ -422,5 +422,324 @@ class JsonOutputTests(unittest.TestCase):
             self.assertTrue((Path(tmp) / "slow.vtt").is_file())
 
 
+# --- Lint & repair (v0.3.0) ----------------------------------------------
+
+MESSY_EXAMPLE = PACK_ROOT / "examples" / "messy-whisper.srt"
+
+# One cue per structural sin, all WARN-level: too short, line too long,
+# too many lines. Timings are chronological with comfortable gaps.
+STRUCTURAL_SRT = """1
+00:00:00,000 --> 00:00:00,500
+Hi.
+
+2
+00:00:02,000 --> 00:00:07,000
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+3
+00:00:09,000 --> 00:00:13,000
+First short line.
+Second short line.
+Third short line.
+"""
+
+# Cue 1 is 0.3s long and cue 2 starts inside it: trimming cue 1's end
+# to (next start - 80ms) would leave 0.12s < 0.4s, so repair must
+# refuse and report it unfixable rather than corrupt the cue.
+UNFIXABLE_SRT = """1
+00:00:00,000 --> 00:00:00,300
+Short.
+
+2
+00:00:00,200 --> 00:00:02,200
+A normal caption follows here.
+"""
+
+# One 6-second cue spread over 3 lines: repair must split it for the
+# line count alone, at a word boundary, keeping every word.
+MANY_LINES_SRT = """1
+00:00:00,000 --> 00:00:06,000
+First part of the caption here
+second part continues on here
+and the third part ends it now
+"""
+
+ALL_EMPTY_SRT = """1
+00:00:01,000 --> 00:00:02,000
+
+"""
+
+OVERLAP_VTT = """WEBVTT
+
+00:00:00.000 --> 00:00:02.600
+Welcome back to the channel everyone.
+
+00:00:02.400 --> 00:00:04.900
+Today we are looking at the highlights.
+"""
+
+
+def words_of(captions):
+    return " ".join(c.text for c in captions).split()
+
+
+class LintTests(unittest.TestCase):
+    def test_lint_clean_file_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "slow.srt", SLOW_SRT)
+            r = run_cli("lint", str(f))
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("Findings: none", r.stdout)
+            self.assertIn("Verdict: PASS", r.stdout)
+
+    def test_lint_messy_example_findings(self):
+        caps = ct.parse_captions_full(MESSY_EXAMPLE)
+        self.assertEqual(len(caps), 6)  # the empty cue IS counted
+        findings = ct.lint_captions(caps)
+        rules = {f["rule"] for f in findings}
+        self.assertTrue({"overlap", "flicker-gap", "empty-text",
+                         "too-long"} <= rules)
+        self.assertEqual(ct.lint_verdict(findings), "HOLD")
+        r = run_cli("lint", str(MESSY_EXAMPLE))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("Verdict: HOLD", r.stdout)
+        self.assertIn("[HOLD] overlap", r.stdout)
+
+    def test_lint_warn_level_rules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "structural.srt", STRUCTURAL_SRT)
+            r = run_cli("lint", str(f))
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("Verdict: WARN", r.stdout)
+            rules = {fd["rule"] for fd in
+                     ct.lint_captions(ct.parse_captions_full(f))}
+            self.assertEqual(rules, {"too-short", "line-too-long",
+                                     "too-many-lines"})
+
+    def test_lint_cps_bands_match_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fast = write(tmp, "fast.srt", FAST_SRT)
+            r = run_cli("lint", str(fast))
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            rules = {fd["rule"] for fd in
+                     ct.lint_captions(ct.parse_captions_full(fast))}
+            self.assertIn("cps-hold", rules)
+            warn = write(tmp, "warn.srt", WARN_SRT)
+            r = run_cli("lint", str(warn))
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            rules = {fd["rule"] for fd in
+                     ct.lint_captions(ct.parse_captions_full(warn))}
+            self.assertIn("cps-fast", rules)
+            self.assertNotIn("cps-hold", rules)
+
+    def test_lint_invalid_cue_is_a_finding_not_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "zero.srt", ZERO_DURATION_SRT)
+            r = run_cli("lint", str(f))
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("invalid-timing", r.stdout)
+            self.assertIn("Verdict: HOLD", r.stdout)
+            self.assertNotIn("ERROR", r.stdout)
+
+    def test_lint_json_agrees_with_text_mode(self):
+        r = run_cli("lint", str(MESSY_EXAMPLE), "--json")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        out = json.loads(r.stdout)
+        self.assertEqual(out["command"], "lint")
+        self.assertEqual(out["verdict"], "HOLD")
+        # lint counts the empty cue that check's parser cannot see.
+        self.assertEqual(out["caption_count"], 6)
+        self.assertEqual(len(ct.parse_captions(MESSY_EXAMPLE)), 5)
+        self.assertEqual(out["finding_count"], len(out["findings"]))
+        self.assertEqual(out["hold_count"], 2)
+        rules = {f["rule"] for f in out["findings"]}
+        self.assertIn("overlap", rules)
+        human = run_cli("lint", str(MESSY_EXAMPLE))
+        self.assertEqual(human.returncode, r.returncode)
+
+    def test_lint_json_error_is_json_object(self):
+        r = run_cli("lint", "/nonexistent/nope.srt", "--json")
+        self.assertEqual(r.returncode, 2)
+        out = json.loads(r.stdout)
+        self.assertIn("error", out)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_lint_accepts_vtt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "overlap.vtt", OVERLAP_VTT)
+            r = run_cli("lint", str(f))
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("overlap", r.stdout)
+
+
+class RepairTests(unittest.TestCase):
+    def test_repair_messy_example(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "fixed.srt"
+            r = run_cli("repair", str(MESSY_EXAMPLE), "-o", str(out))
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("dropped — empty text", r.stdout)
+            self.assertIn("split into 2 captions", r.stdout)
+            self.assertIn("lint after repair: PASS", r.stdout)
+            # The repaired file passes lint clean.
+            r2 = run_cli("lint", str(out))
+            self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
+            # Every word survived, in order — nothing reworded.
+            before = ct.parse_captions_full(MESSY_EXAMPLE)
+            after = ct.parse_captions_full(out)
+            self.assertEqual(words_of(after), words_of(before))
+            self.assertEqual(len(after), 6)  # -1 empty, +1 split
+
+    def test_repair_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out1 = Path(tmp) / "one.srt"
+            out2 = Path(tmp) / "two.srt"
+            r1 = run_cli("repair", str(MESSY_EXAMPLE), "-o", str(out1))
+            self.assertEqual(r1.returncode, 0, r1.stdout + r1.stderr)
+            r2 = run_cli("repair", str(out1), "-o", str(out2))
+            self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
+            self.assertIn("No repairs needed", r2.stdout)
+            self.assertEqual(out1.read_bytes(), out2.read_bytes())
+            # And in JSON mode the second run reports zero changes.
+            out3 = Path(tmp) / "three.srt"
+            r3 = run_cli("repair", str(out1), "-o", str(out3), "--json")
+            self.assertEqual(r3.returncode, 0, r3.stdout + r3.stderr)
+            self.assertEqual(json.loads(r3.stdout)["changes"], [])
+
+    def test_repair_unfixable_overlap_left_and_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "unfixable.srt", UNFIXABLE_SRT)
+            out = Path(tmp) / "out.srt"
+            r = run_cli("repair", str(f), "-o", str(out))
+            # The overlap (HOLD) is still there, so the exit code says so.
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("NOT fixed", r.stdout)
+            after = ct.parse_captions_full(out)
+            self.assertAlmostEqual(after[0].end, 0.3)  # untouched
+
+    def test_repair_refuses_invalid_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "zero.srt", ZERO_DURATION_SRT)
+            r = run_cli("repair", str(f))
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("ERROR", r.stdout)
+            self.assertIn("Invalid captions: 1", r.stdout)
+            self.assertFalse((Path(tmp) / "zero.repaired.srt").exists())
+
+    def test_repair_json_reports_changes_and_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "fixed.srt"
+            r = run_cli("repair", str(MESSY_EXAMPLE), "-o", str(out),
+                        "--json")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            data = json.loads(r.stdout)
+            self.assertEqual(data["command"], "repair")
+            self.assertEqual(data["caption_count_before"], 6)
+            self.assertEqual(data["caption_count_after"], 6)
+            self.assertEqual(data["verdict_after"], "PASS")
+            self.assertEqual(data["remaining_findings"], [])
+            actions = [c["action"] for c in data["changes"]]
+            self.assertEqual(actions.count("dropped-empty"), 1)
+            self.assertEqual(actions.count("trimmed-end"), 2)
+            self.assertEqual(actions.count("split"), 1)
+
+    def test_repair_json_error_is_json_object(self):
+        r = run_cli("repair", "/nonexistent/nope.srt", "--json")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("error", json.loads(r.stdout))
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_repair_never_overwrites_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "slow.srt", SLOW_SRT)
+            r = run_cli("repair", str(f), "-o", str(f))
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("ERROR", r.stdout)
+            self.assertEqual(f.read_text(encoding="utf-8"), SLOW_SRT)
+
+    def test_repair_rejects_bad_output_suffix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "slow.srt", SLOW_SRT)
+            r = run_cli("repair", str(f), "-o", str(Path(tmp) / "x.txt"))
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("ERROR", r.stdout)
+
+    def test_repair_splits_cue_with_too_many_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "lines.srt", MANY_LINES_SRT)
+            out = Path(tmp) / "out.srt"
+            r = run_cli("repair", str(f), "-o", str(out))
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("split into 2 captions", r.stdout)
+            before = ct.parse_captions_full(f)
+            after = ct.parse_captions_full(out)
+            self.assertEqual(len(after), 2)
+            self.assertTrue(all(len(c.lines) <= 2 for c in after))
+            self.assertEqual(words_of(after), words_of(before))
+            # Parts tile the original span with an 80ms gap.
+            self.assertAlmostEqual(after[0].start, 0.0)
+            self.assertAlmostEqual(after[1].end, 6.0)
+            self.assertAlmostEqual(after[1].start - after[0].end, 0.08,
+                                   places=3)
+
+    def test_repair_clean_file_no_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "slow.srt", SLOW_SRT)
+            r = run_cli("repair", str(f))
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("No repairs needed", r.stdout)
+            out = Path(tmp) / "slow.repaired.srt"
+            self.assertTrue(out.is_file())
+            before = ct.parse_captions(f)
+            after = ct.parse_captions(out)
+            self.assertEqual(len(after), len(before))
+            for a, b in zip(before, after):
+                self.assertAlmostEqual(a.start, b.start, places=3)
+                self.assertAlmostEqual(a.end, b.end, places=3)
+                self.assertEqual(a.text, b.text)
+
+    def test_repair_all_empty_file_is_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "empty.srt", ALL_EMPTY_SRT)
+            r = run_cli("repair", str(f))
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("ERROR", r.stdout)
+            self.assertFalse((Path(tmp) / "empty.repaired.srt").exists())
+
+    def test_repair_vtt_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "overlap.vtt", OVERLAP_VTT)
+            out = Path(tmp) / "out.vtt"
+            r = run_cli("repair", str(f), "-o", str(out))
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            text = out.read_text(encoding="utf-8")
+            self.assertTrue(text.startswith("WEBVTT"))
+            self.assertIn("00:00:02.320", text)  # overlap trimmed
+            r2 = run_cli("lint", str(out))
+            self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
+
+    def test_split_caption_proportional_spans(self):
+        cap = ct.Caption(
+            start=9.0, end=18.0,
+            lines=["And after the match the manager said the team "
+                   "would keep working hard every single day."])
+        parts, fail = ct.split_caption(cap)
+        self.assertIsNone(fail)
+        self.assertEqual(len(parts), 2)
+        self.assertAlmostEqual(parts[0].start, 9.0)
+        self.assertAlmostEqual(parts[-1].end, 18.0)
+        self.assertAlmostEqual(parts[1].start - parts[0].end, 0.08,
+                               places=6)
+        self.assertTrue(all(p.duration <= 7.0 for p in parts))
+        self.assertTrue(all(len(p.lines) <= 2 for p in parts))
+        self.assertEqual(words_of(parts), words_of([cap]))
+
+    def test_split_single_word_cue_unfixable(self):
+        cap = ct.Caption(start=0.0, end=9.0, lines=["Hellooooo"])
+        parts, fail = ct.split_caption(cap)
+        self.assertIsNone(parts)
+        self.assertIn("single word", fail)
+
+
 if __name__ == "__main__":
     unittest.main()
