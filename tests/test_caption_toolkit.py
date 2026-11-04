@@ -335,5 +335,92 @@ class FixTargetValidationTests(unittest.TestCase):
         self.assertTrue(changes[0].get("blocked"))
 
 
+# --- Agent-ready JSON output (v0.2.0) ------------------------------------
+
+import json  # noqa: E402
+
+
+class JsonOutputTests(unittest.TestCase):
+    """--json: one JSON object, same verdicts and exit codes as text mode;
+    errors are {"error": ...} objects, never plain text or tracebacks."""
+
+    def test_check_json_on_bundled_sample(self):
+        sample = PACK_ROOT / "examples" / "sample.srt"
+        r = run_cli("check", str(sample), "--json")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        out = json.loads(r.stdout)
+        self.assertEqual(out["tool"], "caption-toolkit")
+        self.assertEqual(out["version"], ct.__version__)
+        self.assertEqual(out["command"], "check")
+        self.assertEqual(out["verdict"], "HOLD")
+        self.assertEqual(out["caption_count"], 3)
+        self.assertAlmostEqual(out["max_cps"], 44.0)
+        self.assertAlmostEqual(out["median_cps"], 8.5)
+        self.assertEqual(out["captions"][0]["status"], "hold")
+        self.assertEqual(out["invalid_captions"], [])
+
+    def test_check_json_agrees_with_human_verdict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "slow.srt", SLOW_SRT)
+            human = run_cli("check", str(f))
+            machine = run_cli("check", str(f), "--json")
+            self.assertEqual(human.returncode, machine.returncode)
+            self.assertIn("Verdict: PASS", human.stdout)
+            self.assertEqual(json.loads(machine.stdout)["verdict"], "PASS")
+
+    def test_check_json_error_is_json_object(self):
+        r = run_cli("check", "/nonexistent/nope.srt", "--json")
+        self.assertEqual(r.returncode, 2)
+        out = json.loads(r.stdout)  # parses — never plain text
+        self.assertIn("error", out)
+        self.assertIn("file not found", out["error"])
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_check_json_invalid_captions_hold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "zero.srt", ZERO_DURATION_SRT)
+            r = run_cli("check", str(f), "--json")
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            out = json.loads(r.stdout)
+            self.assertEqual(out["verdict"], "HOLD")
+            self.assertEqual(len(out["invalid_captions"]), 1)
+            self.assertEqual(out["caption_count"], 2)
+
+    def test_fix_json_reports_verdicts_and_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "fixable.srt", FIXABLE_SRT)
+            r = run_cli("fix", str(f), "--json")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            out = json.loads(r.stdout)
+            self.assertEqual(out["command"], "fix")
+            self.assertEqual(out["verdict_before"], "HOLD")
+            self.assertEqual(out["verdict_after"], "PASS")
+            self.assertEqual(len(out["changes"]), 1)
+            self.assertLessEqual(out["changes"][0]["new_cps"], 17.5)
+            self.assertTrue((Path(tmp) / "fixable.fixed.srt").is_file())
+
+    def test_fix_json_bad_target_is_json_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "fixable.srt", FIXABLE_SRT)
+            r = run_cli("fix", str(f), "--target", "0", "--json")
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            out = json.loads(r.stdout)
+            self.assertIn("error", out)
+            self.assertIn("--target", out["error"])
+            self.assertFalse((Path(tmp) / "fixable.fixed.srt").exists())
+
+    def test_convert_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = write(tmp, "slow.srt", SLOW_SRT)
+            r = run_cli("convert", str(f), "--to", "vtt", "--json")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            out = json.loads(r.stdout)
+            self.assertEqual(out["command"], "convert")
+            self.assertEqual(out["from_format"], "srt")
+            self.assertEqual(out["to_format"], "vtt")
+            self.assertEqual(out["caption_count"], 3)
+            self.assertTrue((Path(tmp) / "slow.vtt").is_file())
+
+
 if __name__ == "__main__":
     unittest.main()

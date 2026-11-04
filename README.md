@@ -53,7 +53,22 @@ they are never silently ignored. `check` lists them and returns HOLD;
 `fix` and `convert` refuse with an error and write nothing until the
 timings are corrected by hand.
 
-## Real run (verbatim, v0.1.1)
+## Use with AI agents
+
+Every command takes `--json`: one JSON object with the same verdicts,
+per-caption rows and exit codes as the text report (errors come back as
+`{"error": ...}`):
+
+```bash
+python3 src/caption_toolkit.py check examples/sample.srt --json
+python3 src/caption_toolkit.py fix examples/sample.srt --json
+python3 src/caption_toolkit.py convert examples/sample.srt --to vtt --json
+```
+
+Agents: read [SKILL.md](SKILL.md) first — commands, the full JSON schemas,
+exit codes, and the honesty rules (a HOLD is a hold; `fix` is timing-only).
+
+## Real run (verbatim, v0.2.0)
 
 Input — `examples/sample.srt`, whose first caption crams 44 characters into
 1 second:
@@ -99,7 +114,7 @@ caption-toolkit convert — sample.srt (srt) -> sample.vtt (vtt) | 3 captions
 
 ```bash
 python3 -m unittest discover -s tests -v
-# Ran 21 tests — OK
+# Ran 28 tests — OK
 ```
 
 The suite covers both directions: slow captions PASS (exit 0), a WARN-band

@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.2.0 — 2026-11-03
+
+Agent-ready release (no behaviour change to the text reports):
+
+- **`--json` on all three commands** (`check`, `fix`, `convert`): one
+  JSON object with the same verdicts and details as the text report —
+  per-caption CPS rows with statuses, invalid captions, fix changes with
+  before/after verdicts, conversion results — plus `warnings`. Exit codes
+  unchanged; errors in `--json` mode are `{"error": "..."}` (invalid-
+  caption refusals also carry the `invalid_captions` list) with the same
+  exit code — never a traceback, never plain text.
+- **`SKILL.md`** added at the repo root for AI coding agents: purpose,
+  when to use / not use, exact commands, the output JSON schemas, exit
+  codes, and the honesty rules (a HOLD is a hold; invalid captions are
+  never silently dropped; `fix` is timing-only).
+- README gained a short "Use with AI agents" section.
+- Tests added for the JSON output (parses, verdicts agree with text mode
+  on PASS and HOLD files, invalid captions surface in JSON, fix reports
+  changes, JSON error objects on missing file and bad `--target`); suite
+  is now 28 tests.
+
 ## v0.1.1 — 2026-11-03
 
 Bug-fix release from the owner's bug-free production gate audit. No new
